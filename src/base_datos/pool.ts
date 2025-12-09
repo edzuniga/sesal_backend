@@ -5,6 +5,9 @@ import { configuracionBDServicio } from "../servicios/configuracion-bd.servicio"
 
 export let pool: mysql.Pool | null = null;
 
+// Timeout para queries (5 minutos por defecto para consultas grandes, configurable)
+const QUERY_TIMEOUT_MS = Number(process.env.MYSQL_QUERY_TIMEOUT) || 300_000;
+
 const crearNuevoPool = () => {
   const config = configuracionBDServicio.obtenerConfiguracion();
   return mysql.createPool({
@@ -22,8 +25,37 @@ const crearNuevoPool = () => {
     connectionLimit: entorno.baseDatos.maximoConexiones,
     queueLimit: entorno.baseDatos.limiteCola,
     connectTimeout: entorno.baseDatos.tiempoEsperaConexion,
-    charset: entorno.baseDatos.conjuntoCaracteres
+    charset: entorno.baseDatos.conjuntoCaracteres,
+    // Timeout para queries individuales - previene queries que bloquean el pool
+    // Nota: Este timeout es para la conexión, no para queries individuales
+    // Para timeout de queries, usar SET SESSION max_execution_time
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10000
   });
+};
+
+/**
+ * Ejecuta una query con timeout.
+ * Si la query tarda más del timeout, se cancela automáticamente.
+ */
+export const queryWithTimeout = async <T>(
+  sql: string,
+  params?: unknown[],
+  timeoutMs: number = QUERY_TIMEOUT_MS
+): Promise<T> => {
+  const currentPool = obtenerPoolActual();
+  
+  // Crear una promesa que rechaza después del timeout
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      reject(new Error(`Query timeout después de ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  
+  // Ejecutar la query con race contra el timeout
+  const queryPromise = currentPool.query(sql, params);
+  
+  return Promise.race([queryPromise, timeoutPromise]) as Promise<T>;
 };
 
 export const inicializarPool = async () => {

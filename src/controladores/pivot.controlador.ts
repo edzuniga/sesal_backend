@@ -8,6 +8,7 @@ import {
   type PivotQueryPayload
 } from "../servicios/pivot.servicio";
 import { logger } from "../utilidades/registro.utilidad";
+import { cache } from "../utilidades/cache.utilidad";
 
 export const catalogoPivotControlador = async (
   _req: Request,
@@ -90,8 +91,19 @@ export const ejecutarPivotControlador = async (
   }
 };
 
-
-
-
+export const estadisticasCacheControlador = async (
+  _req: Request,
+  res: Response,
+  _next: NextFunction
+) => {
+  const stats = cache.getStats();
+  const hitRatio = cache.getHitRatio();
+  
+  return res.status(200).json({
+    ...stats,
+    hitRatio: `${(hitRatio * 100).toFixed(2)}%`,
+    generadoEn: new Date().toISOString()
+  });
+};
 
 

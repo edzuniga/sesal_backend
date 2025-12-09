@@ -2,6 +2,7 @@ import type { RowDataPacket } from "mysql2";
 import type { Pool } from "mysql2/promise";
 
 import { obtenerPoolActual } from "../base_datos/pool";
+import { cache, CACHE_TTL, CACHE_KEYS } from "../utilidades/cache.utilidad";
 
 const tomarPool = () => obtenerPoolActual();
 
@@ -65,6 +66,7 @@ interface PivotValueRequest {
 
 export interface PivotQueryPayload {
   year?: number;
+  years?: number[];
   filters?: PivotFilter[];
   rows?: string[];
   columns?: string[];
@@ -108,6 +110,8 @@ export interface PivotCatalogo {
   actualizadoEn: string;
 }
 
+// JOINs con COLLATE explícito para evitar errores de mezcla de collations
+// CAST AS CHAR produce utf8mb4_0900_ai_ci, pero las tablas cat_* usan utf8mb4_unicode_ci
 const JOIN_DEFINITIONS: Record<JoinKey, string> = {
   us: "LEFT JOIN BAS_BDR_US us ON us.C_US = det.C_US",
   cat_concepto:
@@ -129,7 +133,7 @@ const JOIN_DEFINITIONS: Record<JoinKey, string> = {
   cat_formularios:
     "LEFT JOIN cat_formularios cat_formularios ON cat_formularios.codigo COLLATE utf8mb4_unicode_ci = det.V_FORMULARIO COLLATE utf8mb4_unicode_ci",
   concepto_ge:
-    "LEFT JOIN AT2_BDR_CONCEPTOS_GE concepto_ge ON concepto_ge.C_CONCEPTO = det.C_CONCEPTO AND concepto_ge.V_FORMULARIO = det.V_FORMULARIO"
+    "LEFT JOIN AT2_BDR_CONCEPTOS_GE concepto_ge ON concepto_ge.C_CONCEPTO COLLATE utf8mb4_unicode_ci = det.C_CONCEPTO COLLATE utf8mb4_unicode_ci AND concepto_ge.V_FORMULARIO COLLATE utf8mb4_unicode_ci = det.V_FORMULARIO COLLATE utf8mb4_unicode_ci"
 };
 
 const DIMENSIONES: Record<string, DimensionDefinition> = {
@@ -258,18 +262,20 @@ const DIMENSIONES: Record<string, DimensionDefinition> = {
     label: "Municipio",
     alias: "municipio",
     type: "string",
+    // Mostrar solo el nombre del municipio (sin departamento) cuando hay filtro de región
     select: "COALESCE(municipios.D_MUNICIPIO, CONCAT(us.C_DEPARTAMENTO, '-', us.C_MUNICIPIO))",
-    groupBy: "COALESCE(municipios.D_MUNICIPIO, CONCAT(us.C_DEPARTAMENTO, '-', us.C_MUNICIPIO))",
+    // Agrupar por código único (departamento-municipio) para evitar combinar municipios con el mismo nombre
+    groupBy: "us.C_DEPARTAMENTO, us.C_MUNICIPIO, municipios.D_MUNICIPIO",
     valueExpr: "CONCAT(us.C_DEPARTAMENTO, '-', us.C_MUNICIPIO)",
     joins: ["us", "municipios"],
-    orderBy: "COALESCE(municipios.D_MUNICIPIO, CONCAT(us.C_DEPARTAMENTO, '-', us.C_MUNICIPIO))",
+    orderBy: "municipios.D_MUNICIPIO",
     catalog: {
       table: "BAS_BDR_MUNICIPIOS",
       valueColumn: "CONCAT(C_DEPARTAMENTO, '-', C_MUNICIPIO)",
       labelColumn: "D_MUNICIPIO",
       orderBy: "C_DEPARTAMENTO, C_MUNICIPIO",
       preload: false,
-      defaultLimit: 100
+      defaultLimit: 300
     }
   },
   NIVEL_ESTABLECIMIENTO: {
@@ -432,25 +438,33 @@ const MEDIDAS: Record<string, MeasureDefinition> = {
   }
 };
 
-// Límite por defecto reducido para evitar sobrecarga
-// En producción, consultas grandes deben usar límites explícitos
-const DEFAULT_LIMIT = 1000;
-const MAX_LIMIT = 10000; // Máximo absoluto para prevenir consultas excesivamente grandes
+// Límite por defecto para consultas sin columnas pivot
+const DEFAULT_LIMIT = 10000;
+// Límite aumentado para consultas con columnas pivot (necesitan más filas para el pivoteo)
+const DEFAULT_LIMIT_PIVOT = 100000;
+// Máximo absoluto para consultas muy grandes
+const MAX_LIMIT = 500000;
 
 const obtenerTablasDetalleDisponibles = async (): Promise<number[]> => {
-  const pool = tomarPool();
-  const [rows] = await pool.query<RowDataPacket[]>(
-    `SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE '${DETALLE_PREFIX}%'`
+  return cache.getOrSet(
+    CACHE_KEYS.TABLAS_DETALLE,
+    async () => {
+      const pool = tomarPool();
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE '${DETALLE_PREFIX}%'`
+      );
+      return rows
+        .map((row) => {
+          const tableName = String(row.TABLE_NAME ?? "");
+          const yearPart = tableName.replace(DETALLE_PREFIX, "");
+          const year = Number.parseInt(yearPart, 10);
+          return Number.isFinite(year) ? year : undefined;
+        })
+        .filter((year): year is number => typeof year === "number")
+        .sort((a, b) => a - b);
+    },
+    CACHE_TTL.ANIOS_DISPONIBLES
   );
-  return rows
-    .map((row) => {
-      const tableName = String(row.TABLE_NAME ?? "");
-      const yearPart = tableName.replace(DETALLE_PREFIX, "");
-      const year = Number.parseInt(yearPart, 10);
-      return Number.isFinite(year) ? year : undefined;
-    })
-    .filter((year): year is number => typeof year === "number")
-    .sort((a, b) => a - b);
 };
 
 const asegurarJoins = (joinsNecesarios: Set<JoinKey>): string => {
@@ -461,113 +475,131 @@ const asegurarJoins = (joinsNecesarios: Set<JoinKey>): string => {
 };
 
 const obtenerPeriodosDisponibles = async (): Promise<Array<{ anio: number; meses: number[] }>> => {
-  const pool = tomarPool();
+  return cache.getOrSet(
+    CACHE_KEYS.PERIODOS_DISPONIBLES,
+    async () => {
+      const pool = tomarPool();
 
-  const [filas] = await pool.query<RowDataPacket[]>(
-    `SELECT
-        CAST(RIGHT(TABLE_NAME, 4) AS UNSIGNED) AS anio,
-        MAX(CASE WHEN TABLE_ROWS > 0 THEN 1 ELSE 0 END) AS tieneDatos
-     FROM information_schema.TABLES
-     WHERE TABLE_SCHEMA = DATABASE()
-       AND TABLE_NAME LIKE 'AT2_BDT_MENSUAL_DETALLE_%'
-     GROUP BY anio
-     HAVING anio IS NOT NULL
-     ORDER BY anio DESC`
+      const [filas] = await pool.query<RowDataPacket[]>(
+        `SELECT
+            CAST(RIGHT(TABLE_NAME, 4) AS UNSIGNED) AS anio,
+            MAX(CASE WHEN TABLE_ROWS > 0 THEN 1 ELSE 0 END) AS tieneDatos
+         FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME LIKE 'AT2_BDT_MENSUAL_DETALLE_%'
+         GROUP BY anio
+         HAVING anio IS NOT NULL
+         ORDER BY anio DESC`
+      );
+
+      const periodos: Array<{ anio: number; meses: number[] }> = [];
+
+      for (const fila of filas) {
+        const anio = Number(fila.anio);
+        if (!Number.isFinite(anio)) continue;
+
+        periodos.push({
+          anio,
+          meses: [] // No consultamos meses para agilizar la carga del catálogo
+        });
+      }
+
+      return periodos;
+    },
+    CACHE_TTL.ANIOS_DISPONIBLES
   );
-
-  const periodos: Array<{ anio: number; meses: number[] }> = [];
-
-  for (const fila of filas) {
-    const anio = Number(fila.anio);
-    if (!Number.isFinite(anio)) continue;
-
-    periodos.push({
-      anio,
-      meses: [] // No consultamos meses para agilizar la carga del catálogo
-    });
-  }
-
-  return periodos;
 };
 
 export const obtenerCatalogoPivot = async (): Promise<PivotCatalogo> => {
-  const pool = tomarPool();
+  return cache.getOrSet(
+    CACHE_KEYS.CATALOGO_PIVOT,
+    async () => {
+      const pool = tomarPool();
 
-  const periodos = await obtenerPeriodosDisponibles();
-  let aniosDisponibles = periodos.map((p) => p.anio).sort((a, b) => a - b);
+      const periodos = await obtenerPeriodosDisponibles();
+      let aniosDisponibles = periodos.map((p) => p.anio).sort((a, b) => a - b);
 
-  if (!aniosDisponibles.length) {
-    aniosDisponibles = await obtenerTablasDetalleDisponibles();
-  }
+      if (!aniosDisponibles.length) {
+        aniosDisponibles = await obtenerTablasDetalleDisponibles();
+      }
 
-  const dimensiones: PivotCatalogoDimension[] = [];
+      const dimensiones: PivotCatalogoDimension[] = [];
 
-  for (const dimension of Object.values(DIMENSIONES)) {
-    const base: PivotCatalogoDimension = {
-      id: dimension.id,
-      etiqueta: dimension.label,
-      tipo: dimension.type,
-      admiteFiltrado: true
-    };
+      for (const dimension of Object.values(DIMENSIONES)) {
+        const base: PivotCatalogoDimension = {
+          id: dimension.id,
+          etiqueta: dimension.label,
+          tipo: dimension.type,
+          admiteFiltrado: true
+        };
 
-    // La dimensión ANIO está comentada, ya no se usa
-    if (dimension.id === "MES") {
-      const nombresMeses = [
-        "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-        "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
-      ];
-      base.valores = Array.from({ length: 12 }, (_, idx) => {
-        const mes = idx + 1;
-        return { valor: mes, etiqueta: nombresMeses[idx] };
-      });
-      base.totalValores = 12;
-    } else if (dimension.catalog?.preload) {
-      const limit = dimension.catalog.defaultLimit ?? 200;
-      const [rows] = await pool.query<RowDataPacket[]>(
-        `SELECT ${dimension.catalog.valueColumn} AS valor, ${dimension.catalog.labelColumn} AS etiqueta FROM ${dimension.catalog.table} ORDER BY ${dimension.catalog.orderBy ?? dimension.catalog.labelColumn} LIMIT ?`,
-        [limit]
-      );
-      base.valores = rows.map((row) => ({ valor: row.valor, etiqueta: row.etiqueta }));
-      base.totalValores = rows.length;
-    } else if (dimension.catalog) {
-      const [rows] = await pool.query<RowDataPacket[]>(
-        `SELECT COUNT(*) AS total FROM ${dimension.catalog.table}`
-      );
-      base.totalValores = Number(rows[0]?.total ?? 0);
-      base.endpointValores = `/api/pivot/dimensiones/${dimension.id}/valores`;
-    }
+        // La dimensión ANIO está comentada, ya no se usa
+        if (dimension.id === "MES") {
+          const nombresMeses = [
+            "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+            "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
+          ];
+          base.valores = Array.from({ length: 12 }, (_, idx) => {
+            const mes = idx + 1;
+            return { valor: mes, etiqueta: nombresMeses[idx] };
+          });
+          base.totalValores = 12;
+        } else if (dimension.catalog?.preload) {
+          const limit = dimension.catalog.defaultLimit ?? 200;
+          const [rows] = await pool.query<RowDataPacket[]>(
+            `SELECT ${dimension.catalog.valueColumn} AS valor, ${dimension.catalog.labelColumn} AS etiqueta FROM ${dimension.catalog.table} ORDER BY ${dimension.catalog.orderBy ?? dimension.catalog.labelColumn} LIMIT ?`,
+            [limit]
+          );
+          base.valores = rows.map((row) => ({ valor: row.valor, etiqueta: row.etiqueta }));
+          base.totalValores = rows.length;
+        } else if (dimension.catalog) {
+          const [rows] = await pool.query<RowDataPacket[]>(
+            `SELECT COUNT(*) AS total FROM ${dimension.catalog.table}`
+          );
+          base.totalValores = Number(rows[0]?.total ?? 0);
+          base.endpointValores = `/api/pivot/dimensiones/${dimension.id}/valores`;
+        }
 
-    dimensiones.push(base);
-  }
+        dimensiones.push(base);
+      }
 
-  const medidas: PivotCatalogoMedida[] = Object.values(MEDIDAS).map((medida) => ({
-    id: medida.id,
-    etiqueta: medida.label,
-    descripcion: medida.description,
-    agregacionPorDefecto: medida.defaultAggregation
-  }));
+      const medidas: PivotCatalogoMedida[] = Object.values(MEDIDAS).map((medida) => ({
+        id: medida.id,
+        etiqueta: medida.label,
+        descripcion: medida.description,
+        agregacionPorDefecto: medida.defaultAggregation
+      }));
 
-  return {
-    dimensiones,
-    medidas,
-    actualizadoEn: new Date().toISOString()
-  };
+      return {
+        dimensiones,
+        medidas,
+        actualizadoEn: new Date().toISOString()
+      };
+    },
+    CACHE_TTL.CATALOGO_PIVOT
+  );
 };
 
 export const obtenerAniosDisponibles = async (): Promise<number[]> => {
-  try {
-    const periodos = await obtenerPeriodosDisponibles();
-    if (periodos.length > 0) {
-      return periodos.map(p => p.anio).sort((a, b) => b - a); // Más reciente primero
-    }
-    
-    // Fallback: obtener años de las tablas de detalle
-    const anios = await obtenerTablasDetalleDisponibles();
-    return anios.sort((a, b) => b - a);
-  } catch (error) {
-    console.error("Error obteniendo años disponibles:", error);
-    return [2025]; // Fallback por defecto
-  }
+  return cache.getOrSet(
+    CACHE_KEYS.ANIOS_DISPONIBLES,
+    async () => {
+      try {
+        const periodos = await obtenerPeriodosDisponibles();
+        if (periodos.length > 0) {
+          return periodos.map(p => p.anio).sort((a, b) => b - a); // Más reciente primero
+        }
+        
+        // Fallback: obtener años de las tablas de detalle
+        const anios = await obtenerTablasDetalleDisponibles();
+        return anios.sort((a, b) => b - a);
+      } catch (error) {
+        console.error("Error obteniendo años disponibles:", error);
+        return [2025]; // Fallback por defecto
+      }
+    },
+    CACHE_TTL.ANIOS_DISPONIBLES
+  );
 };
 
 export const obtenerValoresDimension = async (
@@ -797,10 +829,18 @@ const normalizarValoresFiltro = (dimension: DimensionDefinition, valores?: Array
   return valores.map((valor) => String(valor));
 };
 
-const construirUnionAnios = (anios: number[]): string => {
+// Columnas base que siempre se necesitan de las tablas de detalle
+const COLUMNAS_DETALLE_BASE = [
+  'C_US', 'N_ANIO', 'N_MES', 'C_SERVICIO', 'C_CONCEPTO', 'V_FORMULARIO',
+  'Q_AT_ENFERMERA_AUX', 'Q_AT_ENFERMERA_PRO', 'Q_AT_MEDICO_GEN', 'Q_AT_MEDICO_ESP'
+];
+
+const construirUnionAnios = (anios: number[], columnasExtra?: string[]): string => {
+  // Usar columnas específicas en lugar de SELECT * para mejor rendimiento
+  const columnas = [...COLUMNAS_DETALLE_BASE, ...(columnasExtra ?? [])].join(', ');
   const partes = anios
     .map((anio) => `${DETALLE_PREFIX}${anio}`)
-    .map((tabla) => `SELECT * FROM ${tabla}`);
+    .map((tabla) => `SELECT ${columnas} FROM ${tabla}`);
   return `(${partes.join(" UNION ALL ")}) det`;
 };
 
@@ -977,7 +1017,11 @@ const transformarDatosPivot = (
         medidas.forEach(medida => {
           const claveCelda = `${valorColumna}_${medida.id}`;
           const valorCrudo = fila[medida.etiqueta] ?? fila[medida.alias];
-          filaPivot[claveCelda] = typeof valorCrudo === "number" ? valorCrudo : 0;
+          // Convertir a número si es string numérico
+          const valorNumerico = typeof valorCrudo === "number" 
+            ? valorCrudo 
+            : (typeof valorCrudo === "string" ? parseFloat(valorCrudo) || 0 : 0);
+          filaPivot[claveCelda] = valorNumerico;
         });
       }
     });
@@ -1095,10 +1139,37 @@ async function ejecutarConsultaAgregada(payload: PivotQueryPayload): Promise<Piv
   };
 }
 
+// Genera una clave de caché única para una consulta pivot
+const generarClaveCachePivot = (payload: PivotQueryPayload): string => {
+  // Usar years si está definido, sino year, sino 'all'
+  const aniosKey = payload.years?.length 
+    ? `ys:${payload.years.sort((a,b) => a-b).join(',')}` 
+    : `y:${payload.year ?? 'all'}`;
+  
+  const partes = [
+    aniosKey,
+    `r:${(payload.rows ?? []).sort().join(',')}`,
+    `c:${(payload.columns ?? []).sort().join(',')}`,
+    `v:${(payload.values ?? []).map(v => `${v.field}:${v.aggregation ?? 'default'}`).sort().join(',')}`,
+    `f:${(payload.filters ?? []).map(f => `${f.field}:${(f.values ?? []).sort().join('|')}`).sort().join(',')}`,
+    `l:${payload.limit ?? 'default'}`,
+    `t:${payload.includeTotals ?? false}`
+  ];
+  return `pivot:query:${partes.join(':')}`;
+};
+
 export async function ejecutarConsultaPivot(payload: PivotQueryPayload): Promise<PivotQueryResult> {
+  // Verificar caché primero
+  const claveCache = generarClaveCachePivot(payload);
+  const resultadoCacheado = cache.get<PivotQueryResult>(claveCache);
+  if (resultadoCacheado) {
+    return resultadoCacheado;
+  }
+
   // Intentar usar tabla de agregación optimizada primero
   const resultadoAgregado = await ejecutarConsultaAgregada(payload);
   if (resultadoAgregado) {
+    cache.set(claveCache, resultadoAgregado, CACHE_TTL.CONSULTA_PIVOT);
     return resultadoAgregado;
   }
   
@@ -1146,7 +1217,15 @@ export async function ejecutarConsultaPivot(payload: PivotQueryPayload): Promise
   const anioReciente = aniosDisponibles.length ? Math.max(...aniosDisponibles) : 2025;
   let aniosConsulta: number[] = [];
 
-  if (payload.year !== undefined) {
+  // Prioridad: years (array) > year (single) > filtros > año más reciente
+  if (payload.years !== undefined && payload.years.length > 0) {
+    // Validar que todos los años solicitados estén disponibles
+    const aniosValidos = payload.years.filter(a => aniosDisponibles.includes(a));
+    if (aniosValidos.length === 0) {
+      throw new Error(`Ninguno de los años solicitados está disponible en la base de datos`);
+    }
+    aniosConsulta = aniosValidos.sort((a, b) => a - b);
+  } else if (payload.year !== undefined) {
     if (!aniosDisponibles.includes(payload.year)) {
       throw new Error(`El año ${payload.year} no está disponible en la base de datos`);
     }
@@ -1171,7 +1250,13 @@ export async function ejecutarConsultaPivot(payload: PivotQueryPayload): Promise
   const whereClause = condiciones.length ? `WHERE ${condiciones.join(" AND ")}` : "";
   const groupByClause = groupBy.length ? `GROUP BY ${groupBy.join(", ")}` : "";
   const orderByClause = orderBy.length ? `ORDER BY ${orderBy.join(", ")}` : "";
-  const limit = Math.min(payload.limit ?? DEFAULT_LIMIT, MAX_LIMIT);
+  
+  // Usar límite basado en si hay columnas pivot
+  const tieneColumnasPivot = columnas.length > 0;
+  const defaultLimit = tieneColumnasPivot ? DEFAULT_LIMIT_PIVOT : DEFAULT_LIMIT;
+  const limit = Math.min(payload.limit ?? defaultLimit, MAX_LIMIT);
+  
+  console.log(`[Pivot] Consultando ${aniosConsulta.length} año(s): ${aniosConsulta.join(', ')} | Límite: ${limit} filas`);
 
   const selectClause = [
     ...selects,
@@ -1273,7 +1358,7 @@ export async function ejecutarConsultaPivot(payload: PivotQueryPayload): Promise
       })()
     : totalGeneral;
 
-  return {
+  const resultado: PivotQueryResult = {
     datos: datosTransformados,
     totalGeneral: totalGeneralFinal,
     aniosConsultados: aniosConsulta,
@@ -1284,4 +1369,9 @@ export async function ejecutarConsultaPivot(payload: PivotQueryPayload): Promise
       medidasSeleccionadas: valoresSolicitud.map((valor) => valor.field)
     }
   };
+
+  // Guardar en caché antes de retornar
+  cache.set(claveCache, resultado, CACHE_TTL.CONSULTA_PIVOT);
+  
+  return resultado;
 };

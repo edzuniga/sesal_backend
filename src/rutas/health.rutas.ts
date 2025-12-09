@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { pool } from '../base_datos/pool';
 import { obtenerEstadisticasQueries } from '../utilidades/query-logging.utilidad';
 import { entorno } from '../configuracion/entorno';
+import { cache } from '../utilidades/cache.utilidad';
 
 const router = Router();
 
@@ -73,7 +74,46 @@ router.get('/metrics', async (_req: Request, res: Response) => {
           sql: q.sql.substring(0, 150),
           timestamp: q.timestamp.toISOString()
         }))
+      },
+      cache: {
+        ...cache.getStats(),
+        hitRatio: (cache.getHitRatio() * 100).toFixed(2) + '%'
       }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Error desconocido'
+    });
+  }
+});
+
+// Endpoint para limpiar el caché (útil después de actualizaciones de datos)
+router.post('/cache/clear', (_req: Request, res: Response) => {
+  try {
+    const statsBefore = cache.getStats();
+    cache.clear();
+    
+    return res.json({
+      success: true,
+      message: 'Caché limpiado correctamente',
+      entriesCleared: statsBefore.size
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Error desconocido'
+    });
+  }
+});
+
+// Endpoint para ver el estado del caché
+router.get('/cache', (_req: Request, res: Response) => {
+  try {
+    const stats = cache.getStats();
+    
+    return res.json({
+      ...stats,
+      hitRatio: (cache.getHitRatio() * 100).toFixed(2) + '%'
     });
   } catch (error) {
     return res.status(500).json({
