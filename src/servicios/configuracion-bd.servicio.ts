@@ -6,7 +6,7 @@ import {
   eliminarConfiguracionPersistida,
   guardarConfiguracionPersistida,
   leerConfiguracionPersistida,
-  type ConfiguracionPersistida
+  type ConfiguracionPersistida,
 } from "../utilidades/configuracion-archivo.utilidad";
 
 export interface DatabaseConfig {
@@ -18,7 +18,8 @@ export interface DatabaseConfig {
   ssl: boolean;
 }
 
-const encryptPassword = (password: string): string => Buffer.from(password, "utf8").toString("base64");
+const encryptPassword = (password: string): string =>
+  Buffer.from(password, "utf8").toString("base64");
 const decryptPassword = (passwordEncrypted: string): string =>
   Buffer.from(passwordEncrypted, "base64").toString("utf8");
 
@@ -28,7 +29,7 @@ const normalizarConfig = (config: DatabaseConfig): DatabaseConfig => ({
   username: config.username.trim(),
   password: config.password ?? "",
   database: config.database.trim(),
-  ssl: Boolean(config.ssl)
+  ssl: Boolean(config.ssl),
 });
 
 class ConfiguracionBDServicio {
@@ -43,7 +44,7 @@ class ConfiguracionBDServicio {
       username: entorno.baseDatos.usuario,
       password: entorno.baseDatos.contrasena,
       database: entorno.baseDatos.nombre,
-      ssl: false
+      ssl: false,
     };
   }
 
@@ -58,7 +59,7 @@ class ConfiguracionBDServicio {
         username: guardada.username,
         database: guardada.database,
         ssl: guardada.ssl,
-        password: decryptPassword(guardada.passwordEncrypted)
+        password: decryptPassword(guardada.passwordEncrypted),
       };
     }
   }
@@ -83,7 +84,7 @@ class ConfiguracionBDServicio {
       database: config.database,
       ssl: Boolean(config.ssl),
       passwordEncrypted: encryptPassword(config.password),
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
     };
     await guardarConfiguracionPersistida(payload);
   }
@@ -119,7 +120,7 @@ class ConfiguracionBDServicio {
       ssl: config.ssl,
       esPersonalizada: this.estaUsandoConfiguracionPersonalizada(),
       contextoId: this.contextoId,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     };
   }
 
@@ -129,13 +130,22 @@ class ConfiguracionBDServicio {
     return {
       ...resto,
       ssl: Boolean(resto.ssl),
-      tienePassword: Boolean(password)
+      tienePassword: Boolean(password),
     };
   }
 
   crearPool() {
     const config = this.obtenerConfiguracion();
     const normalizado = normalizarConfig(config);
+
+    console.log("🧩 DB CONFIG EN USO:", {
+      host: normalizado.host,
+      port: normalizado.port,
+      user: normalizado.username,
+      database: normalizado.database,
+      ssl: normalizado.ssl,
+    });
+
     return mysql.createPool({
       host: normalizado.host,
       port: normalizado.port,
@@ -144,14 +154,14 @@ class ConfiguracionBDServicio {
       database: normalizado.database,
       ssl: normalizado.ssl
         ? {
-            rejectUnauthorized: false
+            rejectUnauthorized: false,
           }
         : undefined,
       waitForConnections: true,
       connectionLimit: entorno.baseDatos.maximoConexiones,
       queueLimit: entorno.baseDatos.limiteCola,
       connectTimeout: entorno.baseDatos.tiempoEsperaConexion,
-      charset: entorno.baseDatos.conjuntoCaracteres
+      charset: entorno.baseDatos.conjuntoCaracteres,
     });
   }
 
@@ -166,11 +176,11 @@ class ConfiguracionBDServicio {
       database: normalizado.database,
       ssl: normalizado.ssl
         ? {
-            rejectUnauthorized: false
+            rejectUnauthorized: false,
           }
         : undefined,
       connectTimeout: entorno.baseDatos.tiempoEsperaConexion,
-      charset: entorno.baseDatos.conjuntoCaracteres
+      charset: entorno.baseDatos.conjuntoCaracteres,
     });
   }
 }
