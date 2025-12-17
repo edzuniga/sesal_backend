@@ -36,7 +36,9 @@ app.use(
  * CORS (FRONTEND ↔ BACKEND)
  * ================================
  */
-const ORIGENES_PERMITIDOS = ["http://172.16.36.59"];
+const ORIGENES_PERMITIDOS = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(",").map((o) => o.trim())
+  : ["http://172.16.36.59"];
 
 app.use(
   cors({
@@ -48,15 +50,21 @@ app.use(
         return callback(null, true);
       }
 
+      // En desarrollo, permitir todos los orígenes
+      if (entorno.ambiente === "desarrollo") {
+        return callback(null, true);
+      }
+
       return callback(new Error("Origen no permitido por CORS"));
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
   })
 );
 
-// 🔴 NECESARIO para que los preflight OPTIONS no fallen
-app.options("*", cors());
+// El middleware de CORS arriba ya maneja automáticamente las peticiones OPTIONS
+// En Express 5, no se puede usar "*" como ruta
 
 /**
  * ================================

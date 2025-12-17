@@ -51,6 +51,13 @@ class ConfiguracionBDServicio {
   async cargarConfiguracionPersistida() {
     if (this.persistenciaCargada) return;
     this.persistenciaCargada = true;
+
+    // 🔴 En producción, SIEMPRE usar variables de entorno (no archivo persistido)
+    if (entorno.ambiente === "production") {
+      console.log("🔒 Modo producción: usando solo variables de entorno");
+      return;
+    }
+
     const guardada = await leerConfiguracionPersistida();
     if (guardada) {
       this.configuracionPersonalizada = {
@@ -61,10 +68,16 @@ class ConfiguracionBDServicio {
         ssl: guardada.ssl,
         password: decryptPassword(guardada.passwordEncrypted),
       };
+      console.log("📁 Configuración cargada desde archivo persistido");
     }
   }
 
   obtenerConfiguracion(): DatabaseConfig {
+    // 🔴 En producción, SIEMPRE usar variables de entorno
+    if (entorno.ambiente === "production") {
+      return this.obtenerConfigPorDefecto();
+    }
+
     if (this.configuracionPersonalizada) {
       return this.configuracionPersonalizada;
     }

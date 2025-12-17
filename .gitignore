@@ -74,3 +74,10 @@ jspm_packages/
 
 # DynamoDB Local files
 .dynamodb/
+
+# Database configuration (persisted config should not be in git)
+.bi-sesal/
+
+#Variables de entorno
+*.env
+.env

@@ -13,6 +13,7 @@ module.exports = {
         NODE_ENV: "production",
         PORT: 4000,
         MYSQL_HOST: "172.16.34.68",
+        MYSQL_PORT: 3306,
         MYSQL_USER: "root",
         MYSQL_PASSWORD: "Animalit0..9",
         MYSQL_DATABASE: "sesal_historico",
@@ -21,6 +22,7 @@ module.exports = {
         MYSQL_CONNECT_TIMEOUT: 20000,
         MYSQL_CHARSET: "utf8mb4",
         MYSQL_QUERY_TIMEOUT: 300000,
+        CORS_ORIGINS: "http://172.16.36.59",
       },
       // Logs
       error_file: "./logs/error.log",
